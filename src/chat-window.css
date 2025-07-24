@@ -42,3 +42,66 @@
 .draggable-button {
   transition: all 0.2s ease;
 }
+
+.custom-float-button {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #1890ff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: move;
+  position: relative;
+  z-index: 1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15); /* 添加阴影 */
+  transition: all 0.3s ease;
+}
+
+/* 拖拽时增强阴影效果 */
+.custom-float-button.dragging {
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+  transform: scale(0.95);
+  opacity: 0.9;
+}
+
+.status-dot {
+  position: absolute;
+  bottom: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #52c41a;
+  transition: all 0.3s ease;
+  box-shadow: 0 0 4px rgba(82, 196, 26, 0.6);
+}
+
+.custom-float-button:hover {
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+  transform: translateY(-2px);
+}
+
+.custom-float-button:active {
+  transform: translateY(0);
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.custom-float-button.connected {
+  animation: pulse 2s infinite;
+}
+
+.custom-float-button.connected .status-dot {
+  background: #52c41a;
+  box-shadow: 0 0 8px rgba(82, 196, 26, 0.6);
+}
+
+.custom-float-button.disconnected .status-dot {
+  background: #ff4d4f;
+  box-shadow: 0 0 8px rgba(255, 77, 79, 0.6);
+}

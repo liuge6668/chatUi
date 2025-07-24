@@ -168,5 +168,17 @@ button:focus-visible {
       padding: 8px 12px;
       border-top: 1px solid #e8e8e8;
     }
+
+    .draggable-button {
+      touch-action: pan-x pan-y; /* 禁用双指缩放 */
+      user-select: none;
+      -webkit-user-drag: none; /* 禁止拖拽元素时的默认行为 */
+    }
+
+    /* 禁止所有CSS变换 */
+    .custom-float-button:not(.dragging) {
+      transform: none !important;
+      transition: transform 0s !important;
+    }
   }
 }

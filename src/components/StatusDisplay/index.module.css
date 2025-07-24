@@ -1,0 +1,55 @@
+.statusDisplay {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 4px;
+  padding: 4px 8px;
+  transition: all 0.3s ease-in-out;
+  white-space: nowrap;
+}
+
+.statusDisplay:hover {
+  opacity: 0.9;
+}
+
+.error {
+  background-color: #fff1f0;
+  color: #ff4d4f;
+  border: 1px solid #ffccc7;
+}
+
+.connected {
+  background-color: #f6ffed;
+  color: #52c41a;
+  border: 1px solid #b7eb8f;
+}
+
+.connecting {
+  background-color: #fffbe6;
+  color: #faad14;
+  border: 1px solid #ffe58f;
+}
+
+.reconnecting {
+  background-color: #fffbe6;
+  color: #faad14;
+  border: 1px solid #ffe58f;
+}
+
+.disconnected {
+  background-color: #fff1f0;
+  color: #ff4d4f;
+  border: 1px solid #ffccc7;
+}
+
+.icon {
+  margin-right: 8px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.reconnectCount {
+  color: #faad14;
+  margin-left: 4px;
+}

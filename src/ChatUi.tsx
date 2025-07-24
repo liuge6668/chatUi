@@ -10,9 +10,8 @@ import {
   Input,
   List,
   Tooltip,
-  FloatButton,
   Space,
-  message,
+  message as antMessage,
   Spin,
   Popconfirm,
   Alert,
@@ -20,15 +19,17 @@ import {
 import {
   RobotOutlined,
   SendOutlined,
-  ReloadOutlined,
+  DoubleRightOutlined,
+  DoubleLeftOutlined,
   CloseOutlined,
   WarningOutlined,
   ClockCircleOutlined,
 } from "@ant-design/icons";
-import "./index.css";
-import DOMPurify from "dompurify";
 import { v4 as uuidv4 } from "uuid";
-
+import StatusDisplay from "./components/StatusDisplay";
+import FloatButton from "./components/FloatButton";
+import SanitizedHTML from "./components/SanitizedHTML";
+import "./index.css";
 import "./chat-window.css";
 
 // 消息类型定义
@@ -41,6 +42,13 @@ interface Message {
   retryCount?: number;
 }
 
+const RetryStrategy = {
+  Linear: "linear",
+  Exponential: "exponential",
+  Custom: "custom",
+} as const;
+type RetryStrategy = (typeof RetryStrategy)[keyof typeof RetryStrategy];
+
 // 组件props定义
 interface ChatUIProps {
   websocketUrl?: string;
@@ -48,14 +56,20 @@ interface ChatUIProps {
   encryptionKey?: string;
   maxRetries?: number;
   retryDelay?: number;
+  maxRetryDelay?: number; // 最大重试间隔（毫秒）
+  enableExponentialBackoff?: boolean; // 是否启用指数退避
+  retryStrategy?: RetryStrategy;
+  customRetryDelay?: (retryCount: number) => number;
 }
 
 const ChatUI: React.FC<ChatUIProps> = ({
   websocketUrl = "wss://default-ai-api.com/chat",
   authToken = "",
   encryptionKey = "",
-  maxRetries = 3,
-  retryDelay = 3000,
+  maxRetries = 5, // 增加默认重试次数
+  retryDelay = 2000, // 调整基础间隔
+  maxRetryDelay = 10000, // 新增最大间隔
+  enableExponentialBackoff = true, // 默认启用指数退避
 }) => {
   // 状态管理
   const [messages, setMessages] = useState<Message[]>([
@@ -74,16 +88,24 @@ const ChatUI: React.FC<ChatUIProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [showErrorMessage, setShowErrorMessage] = useState(false);
   const [retryMessageId, setRetryMessageId] = useState<string | null>(null);
-
+  // 重试状态管理
+  const [connectionRetryCount, setConnectionRetryCount] = useState(0);
+  const [isAutoConnecting, setIsAutoConnecting] = useState(false);
+  const retryTimeoutRef = useRef<number | null>(null);
   // 对话框尺寸管理
   const [currentWidth, setCurrentWidth] = useState("320px");
-  const sizes = ["320px", "480px", "50vw"];
+  const sizes = ["320px", "480px", "max(50vw, 640px)"];
 
   // 浮动按钮位置状态
   const [buttonPosition, setButtonPosition] = useState({
     x: window.innerWidth - 80 - 24,
     y: window.innerHeight - 40 - 24,
   });
+
+  // 新增索引计算和按钮状态
+  const currentIndex = sizes.indexOf(currentWidth);
+  const isMax = currentIndex === sizes.length - 1;
+  const isMin = currentIndex === 0;
 
   // 拖拽状态
   const [isDragging, setIsDragging] = useState(false);
@@ -97,8 +119,17 @@ const ChatUI: React.FC<ChatUIProps> = ({
   // 引用管理
   const wsRef = useRef<WebSocket | null>(null);
   const messageListRef = useRef<HTMLDivElement>(null);
-  const inputTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const inputTimerRef = useRef<number | null>(null); // 使用number类型代替NodeJS.Timeout
   const failedMessagesRef = useRef<{ [key: string]: Message }>({});
+
+  // 添加更详细的连接状态信息
+  const connectionStatus = useMemo(() => {
+    if (isConnected) return "已连接";
+    if (isConnecting) return "连接中";
+    if (isAutoConnecting)
+      return `自动重连中(${connectionRetryCount}/${maxRetries})`;
+    return "已断开";
+  }, [isConnected, isConnecting, isAutoConnecting, connectionRetryCount]);
 
   // 防抖输入处理
   const handleInputChange = useCallback(
@@ -115,6 +146,50 @@ const ChatUI: React.FC<ChatUIProps> = ({
     []
   );
 
+  // 按钮点击处理
+  const handleSizeChange = (delta: number) => {
+    const newIndex = currentIndex + delta;
+    if (newIndex >= 0 && newIndex < sizes.length) {
+      setCurrentWidth(sizes[newIndex]);
+    }
+  };
+
+  // ChatUI.tsx 在组件中添加防篡改逻辑
+  useEffect(() => {
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        if (
+          mutation.type === "attributes" &&
+          (mutation.attributeName === "style" ||
+            mutation.attributeName === "class")
+        ) {
+          // 检测到样式变化时强制重置
+          const button = document.querySelector<HTMLElement>(
+            ".custom-float-button"
+          );
+          if (
+            button &&
+            (button.offsetWidth !== 40 || button.offsetHeight !== 40)
+          ) {
+            // 强制重置大小
+            button.style.width = "40px";
+            button.style.height = "40px";
+          }
+        }
+      });
+    });
+
+    const buttonElement = document.querySelector(".custom-float-button");
+    if (buttonElement) {
+      observer.observe(buttonElement, {
+        attributes: true,
+        attributeFilter: ["style", "class"],
+        subtree: false,
+      });
+    }
+
+    return () => observer.disconnect();
+  }, []);
   // 消息加密/解密
   const encryptMessage = useCallback(
     (message: string): string => {
@@ -127,7 +202,14 @@ const ChatUI: React.FC<ChatUIProps> = ({
   const decryptMessage = useCallback(
     (encrypted: string): string => {
       if (!encryptionKey) return encrypted;
-      return atob(encrypted);
+      const decrypted = atob(encrypted);
+
+      // 自动检测HTML内容
+      if (/<[a-z][\s\S]*>/i.test(decrypted)) {
+        return decrypted; // 返回原始HTML字符串供SanitizedHTML处理
+      }
+
+      return decrypted;
     },
     [encryptionKey]
   );
@@ -135,12 +217,14 @@ const ChatUI: React.FC<ChatUIProps> = ({
   // 拖拽开始事件
   const handleDragStart = useCallback(
     (e: React.MouseEvent | React.TouchEvent) => {
-      e.preventDefault();
+      e.preventDefault(); // 阻止默认拖拽行为
       setIsDragging(true);
 
+      // 获取触点坐标
       const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
       const clientY = "touches" in e ? e.touches[0].clientY : e.clientY;
 
+      // 保存初始状态
       dragStartPos.startX = clientX;
       dragStartPos.startY = clientY;
       dragStartPos.currentX = buttonPosition.x;
@@ -149,26 +233,40 @@ const ChatUI: React.FC<ChatUIProps> = ({
     [buttonPosition.x, buttonPosition.y]
   );
 
+  useEffect(() => {
+    // 阻止移动端双指缩放
+    const preventPinchZoom = (e: TouchEvent) => {
+      if (e.touches.length > 1) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener("touchmove", preventPinchZoom, { passive: false });
+    return () => window.removeEventListener("touchmove", preventPinchZoom);
+  }, []);
   // 拖拽移动事件
   const handleDragging = useCallback(
     (e: MouseEvent | TouchEvent) => {
       if (!isDragging) return;
       e.preventDefault();
 
+      // 计算坐标偏移量
       const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
       const clientY = "touches" in e ? e.touches[0].clientY : e.clientY;
 
+      // 计算新的位置坐标
       const deltaX = clientX - dragStartPos.startX;
       const deltaY = clientY - dragStartPos.startY;
-
       const newX = dragStartPos.currentX + deltaX;
       const newY = dragStartPos.currentY + deltaY;
 
+      // 添加边界限制
       const minX = 24;
       const minY = 24;
-      const maxX = window.innerWidth - 80;
+      const maxX = window.innerWidth - 40; // 根据按钮实际大小调整
       const maxY = window.innerHeight - 40;
 
+      // 更新按钮位置
       setButtonPosition({
         x: Math.max(minX, Math.min(newX, maxX)),
         y: Math.max(minY, Math.min(newY, maxY)),
@@ -207,22 +305,14 @@ const ChatUI: React.FC<ChatUIProps> = ({
   // 窗口大小变化时调整浮动按钮
   useEffect(() => {
     const handleResize = () => {
-      setButtonPosition((prev) => {
-        const newX = Math.max(24, Math.min(prev.x, window.innerWidth - 80));
-        const newY = Math.max(24, Math.min(prev.y, window.innerHeight - 40));
-        return { x: newX, y: newY };
-      });
+      // 如果当前是动态尺寸（max(50vw, 640px)），强制更新 currentWidth 以触发重渲染
+      if (currentWidth === sizes[2]) {
+        setCurrentWidth(sizes[2]);
+      }
     };
 
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, []);
-
-  // 切换尺寸
-  const handleToggleSize = useCallback(() => {
-    const currentIndex = sizes.indexOf(currentWidth);
-    const nextIndex = (currentIndex + 1) % sizes.length;
-    setCurrentWidth(sizes[nextIndex]);
   }, [currentWidth, sizes]);
 
   // 重试失败消息
@@ -230,6 +320,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
     (messageId: string) => {
       setRetryMessageId(messageId);
       const messageToRetry = failedMessagesRef.current[messageId];
+
       if (messageToRetry && isConnected) {
         setMessages((prev) =>
           prev.map((msg) =>
@@ -242,26 +333,48 @@ const ChatUI: React.FC<ChatUIProps> = ({
               : msg
           )
         );
-        try {
-          const encryptedMessage = encryptMessage(
-            JSON.stringify({
-              id: messageToRetry.id,
-              content: messageToRetry.content,
-              timestamp: messageToRetry.timestamp.toISOString(),
-            })
-          );
-          wsRef.current?.send(encryptedMessage);
-          delete failedMessagesRef.current[messageId];
-          setRetryMessageId(null);
-        } catch (err) {
-          console.error("重试发送失败:", err);
-          message.error("消息重试发送失败");
-          setRetryMessageId(null);
-        }
+
+        // 使用随机延迟防止同时重试
+        const delay = Math.floor(Math.random() * 1000) + 500;
+
+        setTimeout(() => {
+          try {
+            const encryptedMessage = encryptMessage(
+              JSON.stringify({
+                id: messageToRetry.id,
+                content: messageToRetry.content,
+                timestamp: messageToRetry.timestamp.toISOString(),
+              })
+            );
+
+            wsRef.current?.send(encryptedMessage);
+            delete failedMessagesRef.current[messageId];
+            setRetryMessageId(null);
+          } catch (err) {
+            console.error("重试发送失败:", err);
+            antMessage.error("消息重试发送失败");
+            setRetryMessageId(null);
+          }
+        }, delay);
       }
     },
     [isConnected, encryptMessage]
   );
+
+  // 清理函数中添加重试定时器清理
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      if (inputTimerRef.current) {
+        clearTimeout(inputTimerRef.current);
+      }
+      if (retryTimeoutRef.current !== null) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+    };
+  }, []);
 
   // 失败消息处理
   const flushFailedMessages = useCallback(() => {
@@ -298,7 +411,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
             msg.id === message.id ? { ...msg, status: "failed" } : msg
           )
         );
-        message.error("消息发送失败");
+        antMessage.error("消息发送失败");
       }
     },
     [isConnected, encryptMessage]
@@ -315,71 +428,115 @@ const ChatUI: React.FC<ChatUIProps> = ({
     }
   }, [isConnected]);
 
+  // 处理连接重试
+  const handleConnectionRetry = useCallback(() => {
+    if (connectionRetryCount >= maxRetries) {
+      antMessage.error(`已达最大重试次数(${maxRetries})`);
+      return;
+    }
+
+    setIsAutoConnecting(true);
+    const nextRetry = connectionRetryCount + 1;
+    setConnectionRetryCount(nextRetry);
+
+    // 计算带指数退避的延迟时间
+    const delay = enableExponentialBackoff
+      ? Math.min(retryDelay * Math.pow(2, nextRetry), maxRetryDelay)
+      : retryDelay;
+
+    retryTimeoutRef.current = setTimeout(() => {
+      antMessage.info(`正在进行第${nextRetry}次重连尝试`);
+      connectWebSocket();
+    }, delay);
+  }, [
+    connectionRetryCount,
+    retryDelay,
+    maxRetryDelay,
+    enableExponentialBackoff,
+  ]);
+
   // WebSocket连接管理
   const connectWebSocket = useCallback(() => {
-    if (isConnecting || isConnected) return;
+    if (isConnecting || isConnected || isAutoConnecting) return;
+
     setIsConnecting(true);
     setError(null);
     setShowErrorMessage(false);
+
     try {
       const connectUrl = authToken
         ? `${websocketUrl}?token=${encodeURIComponent(authToken)}`
         : websocketUrl;
+
       const ws = new WebSocket(connectUrl);
       wsRef.current = ws;
+
+      // WebSocket打开事件
       ws.onopen = () => {
         setIsConnected(true);
         setIsConnecting(false);
-        message.success("已连接到AI服务器");
+        setIsAutoConnecting(false);
+        setConnectionRetryCount(0);
+        antMessage.success("已连接到AI服务器");
         flushMessageQueue();
         flushFailedMessages();
       };
+
+      // WebSocket消息接收事件
       ws.onmessage = (event) => {
         try {
-          const encryptedData = event.data;
-          const decryptedData = decryptMessage(encryptedData);
-          const data = JSON.parse(decryptedData);
-          if (data.content) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: uuidv4(),
-                content: DOMPurify.sanitize(data.content),
-                role: "ai",
-                timestamp: new Date(),
-                status: "sent",
-              },
-            ]);
-          }
+          // 使用decryptMessage解密消息
+          const encryptedResponse = event.data;
+          const decryptedResponse = decryptMessage(encryptedResponse); // ✅ 调用解密函数
+          const parsedResponse = JSON.parse(decryptedResponse);
+
+          // 更新消息状态
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === parsedResponse.id
+                ? {
+                    ...msg,
+                    content: parsedResponse.content, // 使用解密后的内容
+                    status: "sent",
+                  }
+                : msg
+            )
+          );
         } catch (err) {
-          console.error("消息处理失败:", err);
+          console.error("消息解密/处理失败:", err);
+          antMessage.error("消息处理失败");
         }
       };
+
+      // WebSocket错误事件
       ws.onerror = (error) => {
         console.error("WebSocket Error:", error);
         setError("连接异常");
         ws.close();
+        handleConnectionRetry();
       };
-      ws.onclose = () => {
+
+      // WebSocket关闭事件
+      ws.onclose = (event) => {
         setIsConnected(false);
         setIsConnecting(false);
-        message.error("连接已断开，请检查网络");
-        setError("连接已断开");
-        setShowErrorMessage(true);
+
+        // 仅在非正常关闭时重试
+        if (event.code !== 1000 && connectionRetryCount < maxRetries) {
+          handleConnectionRetry();
+        } else {
+          antMessage.error("连接已断开");
+          setError("连接已断开");
+          setShowErrorMessage(true);
+        }
       };
     } catch (err) {
       console.error("WebSocket初始化失败:", err);
       setError("连接初始化失败");
       setIsConnecting(false);
-      setShowErrorMessage(true);
+      handleConnectionRetry();
     }
-  }, [
-    websocketUrl,
-    authToken,
-    decryptMessage,
-    flushFailedMessages,
-    flushMessageQueue,
-  ]);
+  }, [websocketUrl, authToken, connectionRetryCount, decryptMessage]); // ✅ 将decryptMessage加入依赖数组
 
   // 处理发送消息
   const handleSend = useCallback(() => {
@@ -455,25 +612,16 @@ const ChatUI: React.FC<ChatUIProps> = ({
         onTouchStart={handleDragStart}
       >
         <FloatButton
-          icon={
-            <div style={{ position: "relative" }}>
-              <RobotOutlined />
-              <div
-                style={{
-                  position: "absolute",
-                  bottom: 0,
-                  right: 0,
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  backgroundColor: isConnected ? "#52c41a" : "#ff4d4f",
-                  boxShadow: "0 0 4px rgba(0,0,0,0.3)",
-                }}
-              />
-            </div>
-          }
           onClick={() => setIsExpanded(!isExpanded)}
-          style={{ right: 0 }}
+          isConnected={isConnected}
+          isDragging={isDragging}
+          style={{
+            position: "fixed",
+            left: `${buttonPosition.x}px`,
+            top: `${buttonPosition.y}px`,
+            zIndex: 9998,
+            right: 0,
+          }}
         />
       </div>
 
@@ -493,26 +641,30 @@ const ChatUI: React.FC<ChatUIProps> = ({
             display: "flex",
             flexDirection: "column",
             overflow: "hidden",
+            boxSizing: "border-box", // 防止 padding 影响宽度计算
+            minWidth: "320px", // 防止宽度过小
           }}
         >
           <div className="chat-header">
             <Space>
               <RobotOutlined /> AI助手
             </Space>
-            <Tooltip title="切换尺寸">
-              <ReloadOutlined onClick={handleToggleSize} />
+            <Tooltip title="增大">
+              <Button
+                icon={<DoubleLeftOutlined />}
+                onClick={() => handleSizeChange(1)}
+                disabled={isMax}
+                style={{ marginLeft: 8 }}
+              />
             </Tooltip>
-            {isConnecting && (
-              <span style={{ fontSize: 12, color: "#faad14" }}>
-                <Spin size="small" style={{ marginRight: 8 }} />
-                连接中...
-              </span>
-            )}
-            {error && (
-              <span style={{ fontSize: 12, color: "#ff4d4f" }}>
-                <WarningOutlined /> {error}
-              </span>
-            )}
+            <Tooltip title="缩小">
+              <Button
+                icon={<DoubleRightOutlined />}
+                onClick={() => handleSizeChange(-1)}
+                disabled={isMin}
+              />
+            </Tooltip>
+            <StatusDisplay status={connectionStatus} error={error} />
             <Tooltip title="关闭">
               <CloseOutlined
                 style={{ marginLeft: "auto", cursor: "pointer" }}
@@ -532,7 +684,11 @@ const ChatUI: React.FC<ChatUIProps> = ({
                   key={msg.id}
                 >
                   <div className="message-content">
-                    {msg.content}
+                    <SanitizedHTML
+                      html={msg.content}
+                      className="sanitized-content"
+                      tagName="div"
+                    />
                     {msg.status === "sending" && (
                       <Spin
                         size="small"
