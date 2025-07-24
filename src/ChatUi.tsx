@@ -29,6 +29,7 @@ import { v4 as uuidv4 } from "uuid";
 import StatusDisplay from "./components/StatusDisplay";
 import FloatButton from "./components/FloatButton";
 import SanitizedHTML from "./components/SanitizedHTML";
+import { MockWebSocket } from "./mock/MockWebSocket";
 import "./index.css";
 import "./chat-window.css";
 
@@ -62,6 +63,7 @@ interface ChatUIProps {
   customRetryDelay?: (retryCount: number) => number;
 }
 
+const isDevelopment = import.meta.env.MODE === "development";
 const ChatUI: React.FC<ChatUIProps> = ({
   websocketUrl = "wss://default-ai-api.com/chat",
   authToken = "",
@@ -122,14 +124,63 @@ const ChatUI: React.FC<ChatUIProps> = ({
   const inputTimerRef = useRef<number | null>(null); // 使用number类型代替NodeJS.Timeout
   const failedMessagesRef = useRef<{ [key: string]: Message }>({});
 
-  // 添加更详细的连接状态信息
+  // 在组件中添加 MockWebSocket 状态信息
   const connectionStatus = useMemo(() => {
+    if (isDevelopment) return "模拟连接";
     if (isConnected) return "已连接";
     if (isConnecting) return "连接中";
     if (isAutoConnecting)
       return `自动重连中(${connectionRetryCount}/${maxRetries})`;
     return "已断开";
   }, [isConnected, isConnecting, isAutoConnecting, connectionRetryCount]);
+
+  // 在组件挂载时确保MockWebSocket正确初始化
+  useEffect(() => {
+    if (isDevelopment) {
+      // 确保只初始化一次MockWebSocket
+      const mockWs = MockWebSocket.getInstance();
+
+      // 统一状态更新函数
+      const handleOpen = () => {
+        console.log("Mock connection established");
+        setIsConnected(true);
+        setIsConnecting(false);
+        antMessage.success("已连接到模拟服务器");
+        flushMessageQueue();
+        flushFailedMessages();
+      };
+
+      const handleClose = () => {
+        console.log("Mock connection closed");
+        setIsConnected(false);
+      };
+
+      // 统一管理监听器
+      const cleanupListeners = () => {
+        mockWs.onOpen(() => {}); // 清除旧监听器
+        mockWs.onClose(() => {}); // 清除旧监听器
+      };
+
+      // 设置监听器并触发连接
+      cleanupListeners();
+      mockWs.onOpen(handleOpen);
+      mockWs.onClose(handleClose);
+
+      // 只在需要时触发连接
+      if (!mockWs.isConnected) {
+        mockWs.connect();
+      }
+
+      // 初始状态同步
+      setIsConnected(mockWs.isConnected);
+
+      // 返回清理函数
+      return () => {
+        mockWs.close();
+        cleanupListeners();
+      };
+    }
+  }, [isDevelopment]);
 
   // 防抖输入处理
   const handleInputChange = useCallback(
@@ -398,7 +449,16 @@ const ChatUI: React.FC<ChatUIProps> = ({
             timestamp: message.timestamp.toISOString(),
           })
         );
-        wsRef.current?.send(encryptedMessage);
+
+        if (isDevelopment) {
+          // 使用 MockWebSocket 发送
+          const mockWs = MockWebSocket.getInstance();
+          mockWs.send(encryptedMessage);
+        } else {
+          // 使用真实 WebSocket 发送
+          wsRef.current?.send(encryptedMessage);
+        }
+
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === message.id ? { ...msg, status: "sending" } : msg
@@ -463,6 +523,27 @@ const ChatUI: React.FC<ChatUIProps> = ({
     setError(null);
     setShowErrorMessage(false);
 
+    // 开发环境使用 MockWebSocket
+    // 修改connectWebSocket方法中的MockWebSocket处理逻辑
+    if (isDevelopment) {
+      try {
+        const mockWs = MockWebSocket.getInstance();
+        // 仅做初始化检查
+        if (mockWs.isConnected && !isConnected) {
+          setIsConnected(true);
+        }
+
+        // 设置wsRef
+        wsRef.current = mockWs as any;
+      } catch (error) {
+        console.error("MockWebSocket initialization failed:", error);
+        setError("Mock初始化失败");
+        setIsConnecting(false);
+      }
+      return;
+    }
+
+    // 生产环境 WebSocket 逻辑
     try {
       const connectUrl = authToken
         ? `${websocketUrl}?token=${encodeURIComponent(authToken)}`
@@ -471,44 +552,31 @@ const ChatUI: React.FC<ChatUIProps> = ({
       const ws = new WebSocket(connectUrl);
       wsRef.current = ws;
 
-      // WebSocket打开事件
       ws.onopen = () => {
         setIsConnected(true);
         setIsConnecting(false);
-        setIsAutoConnecting(false);
-        setConnectionRetryCount(0);
         antMessage.success("已连接到AI服务器");
         flushMessageQueue();
         flushFailedMessages();
       };
 
-      // WebSocket消息接收事件
       ws.onmessage = (event) => {
         try {
-          // 使用decryptMessage解密消息
-          const encryptedResponse = event.data;
-          const decryptedResponse = decryptMessage(encryptedResponse); // ✅ 调用解密函数
+          const decryptedResponse = decryptMessage(event.data);
           const parsedResponse = JSON.parse(decryptedResponse);
 
-          // 更新消息状态
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === parsedResponse.id
-                ? {
-                    ...msg,
-                    content: parsedResponse.content, // 使用解密后的内容
-                    status: "sent",
-                  }
+                ? { ...msg, content: parsedResponse.content, status: "sent" }
                 : msg
             )
           );
         } catch (err) {
-          console.error("消息解密/处理失败:", err);
-          antMessage.error("消息处理失败");
+          console.error("消息处理失败:", err);
         }
       };
 
-      // WebSocket错误事件
       ws.onerror = (error) => {
         console.error("WebSocket Error:", error);
         setError("连接异常");
@@ -516,12 +584,10 @@ const ChatUI: React.FC<ChatUIProps> = ({
         handleConnectionRetry();
       };
 
-      // WebSocket关闭事件
       ws.onclose = (event) => {
         setIsConnected(false);
         setIsConnecting(false);
 
-        // 仅在非正常关闭时重试
         if (event.code !== 1000 && connectionRetryCount < maxRetries) {
           handleConnectionRetry();
         } else {
@@ -536,7 +602,7 @@ const ChatUI: React.FC<ChatUIProps> = ({
       setIsConnecting(false);
       handleConnectionRetry();
     }
-  }, [websocketUrl, authToken, connectionRetryCount, decryptMessage]); // ✅ 将decryptMessage加入依赖数组
+  }, [websocketUrl, authToken, connectionRetryCount, decryptMessage]);
 
   // 处理发送消息
   const handleSend = useCallback(() => {
@@ -668,7 +734,10 @@ const ChatUI: React.FC<ChatUIProps> = ({
             <Tooltip title="关闭">
               <CloseOutlined
                 style={{ marginLeft: "auto", cursor: "pointer" }}
-                onClick={() => setIsExpanded(false)}
+                onClick={() => {
+                  setIsExpanded(false);
+                  setCurrentWidth("320px");
+                }}
               />
             </Tooltip>
           </div>
